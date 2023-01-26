@@ -26,7 +26,14 @@
 -type prologue_option() :: {prologue, binary()}.
 -type option() :: prologue_option.
 
--export([]).
+-export([
+    new/5,
+    new/6,
+    new/7,
+    write/1,
+    write/2,
+    read/2
+]).
 -export_type([
     dh_fun/0,
     cipher_fun/0,
@@ -70,6 +77,7 @@
     e    :: undefined | key_pair(),
     rs   :: undefined | binary(),
     re   :: undefined | binary(),
+    psk  :: undefined | binary(),
     buf  :: iodata()    
     }).
 -type handshake() :: #handshake{}.
@@ -77,15 +85,46 @@
 -include("vixen.hrl").
 
 %%%=============================================================================
+%%% Public functions
+%%%=============================================================================
+-spec new(Role :: role(), Hs :: atom(), Dh :: dh_fun(), Cf :: cipher_fun(), Hf :: hash_fun()) -> reference().
+new(Role, Hs, Dh, Cf, Hf) ->
+    new(Role, Hs, Dh, Cf, Hf, []).
+-spec new(Role :: role(), Hs :: atom(), Dh :: dh_fun(), Cf :: cipher_fun(), Hf :: hash_fun(), Keys :: list(key())) -> reference().
+new(Role, Hs, Dh, Cf, Hf, Keys) ->
+    new(Role, Hs, Dh, Cf, Hf, Keys, []).
+-spec new(Role :: role(), Hs :: atom(), Dh :: dh_fun(), Cf :: cipher_fun(), Hf :: hash_fun(), Keys :: list(key()), Opts :: list(option())) -> reference().
+new(Role, Hs, Dh, Cf, Hf, Keys, Opts) ->
+    Ref = make_ref(),
+    put(Ref, handshake(Role, Hs, Dh, Cf, Hf, Keys, Opts)),
+    Ref.
+
+write(Ref) ->
+    write(<<>>, Ref).
+write(PlainText, Ref) ->
+    case write_msg(get(Ref), PlainText) of
+        {Hs, CryptText} ->
+            put(Ref, Hs),
+            CryptText;
+        {Hs, CryptText, Result} ->
+            put(Ref, Hs),
+            {CryptText, Result}
+    end.
+
+read(Ref, CryptText) ->
+    case read_msg(get(Ref), CryptText) of
+        {Hs, PlainText} ->
+            put(Ref, Hs),
+            PlainText;
+        {Hs, PlainText, Result} ->
+            put(Ref, Hs),
+            {PlainText, Result}
+    end.
+
+%%%=============================================================================
 %%% Internal Functions - Handshake state
 %%%=============================================================================
 
--spec handshake(Role :: role(), Hs :: atom(), Dh :: dh_fun(), Cf :: cipher_fun(), Hf :: hash_fun()) -> handshake().
-handshake(Role, Hs, Dh, Cf, Hf) ->
-    handshake(Role, Hs, Dh, Cf, Hf, []).
--spec handshake(Role :: role(), Hs :: atom(), Dh :: dh_fun(), Cf :: cipher_fun(), Hf :: hash_fun(), Keys :: list(key())) -> handshake().
-handshake(Role, Hs, Dh, Cf, Hf, Keys) ->
-    handshake(Role, Hs, Dh, Cf, Hf, Keys, []).
 -spec handshake(Role :: role(), Hs :: atom(), Dh :: dh_fun(), Cf :: cipher_fun(), Hf :: hash_fun(), Keys :: list(key()), Opts :: list(option())) -> handshake().
 handshake(Role, Hs, Dh, Cf, Hf, Keys, Opts) when Role =:= ini orelse Role =:= rsp ->
     Db = proplists:get_value(db, Opts, vixen_db),
@@ -94,13 +133,27 @@ handshake(Role, Hs, Dh, Cf, Hf, Keys, Opts) when Role =:= ini orelse Role =:= rs
         sym  = mix_hash(symmetric(Hs, Dh, Cf, Hf), proplists:get_value(prologue, Opts, <<>>)),
         role = Role,
         dh   = Dh,
-        hs   = Db:lookup(Hs),
+        hs   = modify(proplists:get_value(modifiers, Opts, []), Db:lookup(Hs)),
         s    = proplists:get_value(s, Keys),
         e    = proplists:get_value(e, Keys),
         rs   = proplists:get_value(rs, Keys),
         re   = proplists:get_value(re, Keys),
+        psk  = proplists:get_value(psk, Keys),
         buf  = []},
     mix_premessage_public_keys(St).
+
+modify([], Pats) ->
+    Pats;
+modify([{fallback, true} | Mods], [Pat | Pats]) ->
+    NewPats = 
+        case Pat of
+            {ini, [e]} -> [Pat, {} | Pats];
+            {ini, [s]} -> [Pat, {} | Pats];
+            {ini, [e, s]} -> [Pat, {} | Pats]
+        end,
+    modify(Mods, NewPats);
+modify([{fallback, false} | Mods], Pats) ->
+    modify(Mods, Pats).
 
 -spec mix_premessage_public_keys(St :: handshake()) -> handshake().
 mix_premessage_public_keys(#handshake{hs = Hs} = St) ->
@@ -141,6 +194,8 @@ write_step(e, #handshake{e = undefined, dh = Dh, sym = Sym, buf = Buf} = St) ->
 write_step(s, #handshake{buf = Buf, sym = Sym, s = {SPub, _}} = St) ->
     {NewSym, Crypt} = encrypt_and_hash(Sym, SPub),
     St#handshake{buf = [Buf, Crypt], sym = NewSym};
+write_step(psk, #handshake{sym = Sym, psk = Psk, e = {Public, _}} = St) ->
+    St#handshake{sym = mix_key(mix_key_and_hash(Sym, Psk), Public)};
 write_step(Tok, St) ->
     common_step(Tok, St).
 
@@ -153,6 +208,8 @@ read_step(s, #handshake{dh = Dh, rs = undefined, buf = Buf, sym = Sym} = St) ->
     {Temp, Rest} = split_binary(Buf, KeyLen),
     {NewSym, Plain} = decrypt_and_hash(Sym, Temp),
     St#handshake{buf = Rest, rs = Plain, sym = NewSym};
+read_step(psk, #handshake{sym = Sym, psk = Psk, re = Public} = St) ->
+    St#handshake{sym = mix_key(mix_key_and_hash(Sym, Psk), Public)};
 read_step(Tok, St) ->
     common_step(Tok, St).
 
@@ -164,7 +221,6 @@ common_step(es, #handshake{role = ini, sym = Sym, dh = Dh, e = E, rs = Rs} = St)
 common_step(es, #handshake{role = rsp, sym = Sym, dh = Dh, s = S, re = Re} = St) ->
     St#handshake{sym = mix_key(Sym, vixen_crypto:dh(Dh, S, Re))};
 common_step(se, #handshake{role = ini, sym = Sym, dh = Dh, s = S, re = Re} = St) ->
-    io:format(user, "re: ~p~n", [Re]),
     St#handshake{sym = mix_key(Sym, vixen_crypto:dh(Dh, S, Re))};
 common_step(se, #handshake{role = rsp, sym = Sym, dh = Dh, e = E, rs = Rs} = St) ->
     St#handshake{sym = mix_key(Sym, vixen_crypto:dh(Dh, E, Rs))};
@@ -295,8 +351,8 @@ split(#cipher{cf = Cf}, K1, K2) ->
 %%% Handshake State Tests 
 %%%-----------------------------------------------------------------------------
 handshake_NN_test() ->
-    Ini1 = handshake(ini, 'NN', x25519, chacha20_poly1305, sha256),
-    Rsp1 = handshake(rsp, 'NN', x25519, chacha20_poly1305, sha256),
+    Ini1 = handshake(ini, 'NN', x25519, chacha20_poly1305, sha256, [], []),
+    Rsp1 = handshake(rsp, 'NN', x25519, chacha20_poly1305, sha256, [], []),
 
     {Ini2, Out1} = write_msg(Ini1, <<>>),
     {Rsp2, <<>>} = read_msg(Rsp1, Out1),
@@ -314,8 +370,8 @@ handshake_XX_test() ->
     IniPair = crypto:generate_key(ecdh, x25519),
     RspPair = crypto:generate_key(ecdh, x25519),
 
-    Ini1 = handshake(ini, 'XX', x25519, chacha20_poly1305, sha256, [{s, IniPair}]),
-    Rsp1 = handshake(rsp, 'XX', x25519, chacha20_poly1305, sha256, [{s, RspPair}]),
+    Ini1 = handshake(ini, 'XX', x25519, chacha20_poly1305, sha256, [{s, IniPair}], []),
+    Rsp1 = handshake(rsp, 'XX', x25519, chacha20_poly1305, sha256, [{s, RspPair}], []),
 
     {Ini2, Out1} = write_msg(Ini1, <<>>),
     {Rsp2, <<>>} = read_msg(Rsp1, Out1),
@@ -332,12 +388,33 @@ handshake_XX_test() ->
     {_, MsgX} = encrypt_with_aad(IniOut, Aad, Msg),
     {_, Msg} = decrypt_with_aad(RspIn, Aad, MsgX).
 
+handshake_XXFallback_test() ->
+    StaticIniPair = crypto:generate_key(ecdh, x25519),
+    StaticRspPair = crypto:generate_key(ecdh, x25519),
+    {EphemeralIniPub, _} = EphemeralIniPair = crypto:generate_key(ecdh, x25519),
+
+    Mods = [{fallback, true}],
+    Ini1 = handshake(ini, 'XX', x25519, chacha20_poly1305, sha256, [{s, StaticIniPair}, {e, EphemeralIniPair}], [{modifiers, Mods}]),
+    Rsp1 = handshake(rsp, 'XX', x25519, chacha20_poly1305, sha256, [{s, StaticRspPair}, {re, EphemeralIniPub}], [{modifiers, Mods}]),
+
+    {Rsp2, Out1} = write_msg(Rsp1, <<>>),
+    {Ini2, <<>>} = read_msg(Ini1, Out1),
+
+    {_Ini3, Out2, {_IniIn, IniOut}} = write_msg(Ini2, <<>>),
+    {_Rsp3, <<>>, {RspIn, _RspOut}} = read_msg(Rsp2, Out2),
+
+    Msg = crypto:strong_rand_bytes(1024),
+    Aad = crypto:strong_rand_bytes(32),
+
+    {_, MsgX} = encrypt_with_aad(IniOut, Aad, Msg),
+    {_, Msg} = decrypt_with_aad(RspIn, Aad, MsgX).
+
 handshake_KK_test() ->
     {IniPub, _IniPriv} = IniPair = crypto:generate_key(ecdh, x25519),
     {RspPub, _RspPriv} = RspPair = crypto:generate_key(ecdh, x25519),
 
-    Ini1 = handshake(ini, 'KK', x25519, chacha20_poly1305, sha256, [{s, IniPair}, {rs, RspPub}]),
-    Rsp1 = handshake(rsp, 'KK', x25519, chacha20_poly1305, sha256, [{s, RspPair}, {rs, IniPub}]),
+    Ini1 = handshake(ini, 'KK', x25519, chacha20_poly1305, sha256, [{s, IniPair}, {rs, RspPub}], []),
+    Rsp1 = handshake(rsp, 'KK', x25519, chacha20_poly1305, sha256, [{s, RspPair}, {rs, IniPub}], []),
 
     {Ini2, Out1} = write_msg(Ini1, <<>>),
     {Rsp2, <<>>} = read_msg(Rsp1, Out1),
