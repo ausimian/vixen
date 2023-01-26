@@ -14,6 +14,9 @@
 
 %% External API
 -export([
+    dh/3,
+    dh_len/1,
+    generate_keypair/1,
     encrypt/5,
     decrypt/5,
     rekey/2,
@@ -27,6 +30,18 @@
 %%%=============================================================================
 %%% API
 %%%=============================================================================
+
+-spec dh(Dh :: vixen:dh_fun(), Private :: vixen:key_pair(), Public :: binary) -> binary().
+dh(Dh, {_, Private}, Public) when Dh =:= x25519 orelse Dh =:= x448 ->
+    crypto:compute_key(ecdh, Public, Private, Dh).
+
+-spec dh_len(vixen:dh_fun()) -> 32 | 56.
+dh_len(x25519) -> 32;
+dh_len(x448) -> 56.
+
+-spec generate_keypair(Dh :: vixen:dh_fun()) -> vixen:key_pair().
+generate_keypair(Dh) when Dh =:= x25519 orelse Dh =:= x448 ->
+    crypto:generate_key(ecdh, Dh).
 
 -spec encrypt(
     Cf        :: vixen:cipher_fun(),

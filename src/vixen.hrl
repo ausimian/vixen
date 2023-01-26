@@ -1,1 +1,2 @@
 -define(REKEY_NONCE, 18446744073709551615).
+-define(SEP, {}).
