@@ -9,7 +9,6 @@
    ]},
   {env,[]},
   {modules, [vixen, vixen_crypto, vixen_db]},
-
   {licenses, ["Apache 2.0"]},
   {links, []}
  ]}.

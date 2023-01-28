@@ -1,6 +1,6 @@
 %%%-----------------------------------------------------------------------------
 %%% @doc
-%%% Vixen - an implementation of the Noise Protocol
+%%% The vixen API module.
 %%% @author ausimian
 %%% @end
 %%%-----------------------------------------------------------------------------
@@ -10,44 +10,95 @@
 -define(VSN, 1).
 -vsn(?VSN).
 
--type dh_fun() :: x25519 | x448.
--type cipher_fun() :: chacha20_poly1305 | aes_256_gcm.
+-type dh_fun() :: x25519 | x448. 
+%% The supported DH curves.
+
+-type cipher_fun() :: chacha20_poly1305 | aes_256_gcm. 
+%% The supported ciphers.
+
 -type hash_fun() :: sha256 | sha512 | blake2s | blake2b.
+%% The supported hash functions.
+
 -type role() :: ini | rsp.
+%% The role each party in the handshake may take.
+%% 
+%% <ul>
+%% <li>`ini': Initiator - sends the first message in the handshake.</li>
+%% <li>`rsp': Responder - receives the first message in the handshake.</li>
+%% </ul>
+%% Thereafter, the Responder will send the second message and the Initiator
+%% will receive it. The process continues until both sides have completed the
+%% handshake.
+
 -type public_key() :: binary().
+%% A public key.
+%% 
+%% The length of the public key will depend on the curve chosen for DH key agreement.
+
 -type private_key() :: binary().
+%% A private key.
+%% 
+%% The length of the private key will depend on the curve chosen for DH key agreement.
+
 -type key_pair() :: {public_key(), private_key()}.
--type key() :: {s, key_pair()} | {e, key_pair()} | {re, public_key()} | {rs, public_key()}.
+%% A tuple consisting of a public key followed by a private key.
+
+-type key() :: {s, key_pair()} | {e, key_pair()} | {re, public_key()} | {rs, public_key() | {psk, <<_:256>>}}.
+%% Possible key types the client can preconfigure the handshake with.
 
 -type token() :: e | s | ee | es | se | ss | psk.
+%% The set of valid message tokens.
+
 -type message_pattern() :: {role(), [token()]} | {}.
+%% A message pattern describes a sequence of steps taken first by one party, and then
+%% the other.
+%% 
+%% The _initiator_ is the party that executes the steps of the first message pattern.
+
 -type handshake_pattern() :: [message_pattern()].
+%% A handshake pattern is a list of message-patterns describing a complete handshake.
 
 -type prologue_option() :: {prologue, binary()}.
--type option() :: prologue_option.
+%% Arbitrary data mixed into the handshake hash. 
+%% 
+%% Both parties must provide identical %% prologue data or the handshake will fail. 
+%% See the %% <a href="https://noiseprotocol.org/noise.html#prologue">Prologue</a>
+%% section of the Noise Protocol.
+
+-type db_option() :: {db, module()}.  
+%% The module used to lookup the handshake by name.
+%% 
+%% Defaults to {@link vixen_db}. Must export `lookup/1'.
+
+-type fallback_option() :: fallback | {fallback, boolean()}.
+%% When true, the fallback option adjusts the specified handshake as described in the
+%% <a href="http://www.noiseprotocol.org/noise.html#the-fallback-modifier">Fallback modifier</a>
+%% section of the Noise Protocol.
+
+-type option() :: prologue_option() | db_option() | fallback_option().
+%% The set of options that may be passed to {@link new/7}.
 
 -export([
-    new/5,
     new/6,
     new/7,
-    write/1,
-    write/2,
-    read/2
+    hs_write/1,
+    hs_write/2,
+    hs_read/2
 ]).
 -export_type([
-    dh_fun/0,
     cipher_fun/0,
+    dh_fun/0,
+    handshake_pattern/0,
     hash_fun/0,
-    role/0,
-    public_key/0,
-    private_key/0,
     key_pair/0,
     key/0,
-    token/0,
     message_pattern/0,
-    handshake_pattern/0,
+    option/0,
+    private_key/0,
     prologue_option/0,
-    option/0
+    public_key/0,
+    role/0,
+    token/0
     ]).
 
 -record(cipher, {
@@ -87,31 +138,44 @@
 %%%=============================================================================
 %%% Public functions
 %%%=============================================================================
--spec new(Role :: role(), Hs :: atom(), Dh :: dh_fun(), Cf :: cipher_fun(), Hf :: hash_fun()) -> reference().
-new(Role, Hs, Dh, Cf, Hf) ->
-    new(Role, Hs, Dh, Cf, Hf, []).
+
+%%%-----------------------------------------------------------------------------
+%%% @doc Creates a new handshake with the specified premessage keys.
+%%% @see new/7.
+%%% @end
+%%%-----------------------------------------------------------------------------
 -spec new(Role :: role(), Hs :: atom(), Dh :: dh_fun(), Cf :: cipher_fun(), Hf :: hash_fun(), Keys :: list(key())) -> reference().
 new(Role, Hs, Dh, Cf, Hf, Keys) ->
     new(Role, Hs, Dh, Cf, Hf, Keys, []).
+
+%%%-----------------------------------------------------------------------------
+%%% @doc Creates a new handshake with the specified premessage keys and modifiers.
+%%% 
+%%% This is some text. This is some more.
+%%% 
+%%% And this is even more.
+%%% @end
+%%%-----------------------------------------------------------------------------
 -spec new(Role :: role(), Hs :: atom(), Dh :: dh_fun(), Cf :: cipher_fun(), Hf :: hash_fun(), Keys :: list(key()), Opts :: list(option())) -> reference().
 new(Role, Hs, Dh, Cf, Hf, Keys, Opts) ->
     Ref = make_ref(),
     put(Ref, handshake(Role, Hs, Dh, Cf, Hf, Keys, Opts)),
     Ref.
 
-write(Ref) ->
-    write(<<>>, Ref).
-write(PlainText, Ref) ->
-    case write_msg(get(Ref), PlainText) of
-        {Hs, CryptText} ->
-            put(Ref, Hs),
+hs_write(Ref) ->
+    hs_write(<<>>, Ref).
+hs_write(PlainText, Ref) ->
+    Hs1 = #handshake{} = get(Ref),
+    case write_msg(Hs1, PlainText) of
+        {Hs2, CryptText} ->
+            put(Ref, Hs2),
             CryptText;
-        {Hs, CryptText, Result} ->
-            put(Ref, Hs),
+        {Hs2, CryptText, Result} ->
+            put(Ref, Hs2),
             {CryptText, Result}
     end.
 
-read(Ref, CryptText) ->
+hs_read(Ref, CryptText) ->
     case read_msg(get(Ref), CryptText) of
         {Hs, PlainText} ->
             put(Ref, Hs),
@@ -133,7 +197,7 @@ handshake(Role, Hs, Dh, Cf, Hf, Keys, Opts) when Role =:= ini orelse Role =:= rs
         sym  = mix_hash(symmetric(Hs, Dh, Cf, Hf), proplists:get_value(prologue, Opts, <<>>)),
         role = Role,
         dh   = Dh,
-        hs   = modify(proplists:get_value(modifiers, Opts, []), Db:lookup(Hs)),
+        hs   = modify(Opts, Db:lookup(Hs)),
         s    = proplists:get_value(s, Keys),
         e    = proplists:get_value(e, Keys),
         rs   = proplists:get_value(rs, Keys),
@@ -144,7 +208,11 @@ handshake(Role, Hs, Dh, Cf, Hf, Keys, Opts) when Role =:= ini orelse Role =:= rs
 
 modify([], Pats) ->
     Pats;
-modify([{fallback, true} | Mods], [Pat | Pats]) ->
+modify([{fallback, true} | Mods], Pats) ->
+    modify([fallback | Mods], Pats);
+modify([{fallback, false} | Mods], Pats) ->
+    modify(Mods, Pats);
+modify([fallback | Mods], [Pat | Pats]) ->
     NewPats = 
         case Pat of
             {ini, [e]} -> [Pat, {} | Pats];
@@ -152,7 +220,7 @@ modify([{fallback, true} | Mods], [Pat | Pats]) ->
             {ini, [e, s]} -> [Pat, {} | Pats]
         end,
     modify(Mods, NewPats);
-modify([{fallback, false} | Mods], Pats) ->
+modify([_ | Mods], Pats) ->
     modify(Mods, Pats).
 
 -spec mix_premessage_public_keys(St :: handshake()) -> handshake().
@@ -175,13 +243,13 @@ mix_premessage_public_keys([{Role, [e | Keys]} | Msgs], #handshake{role = Role, 
 mix_premessage_public_keys([{Role, [e | Keys]} | Msgs], #handshake{re = Public, sym = Sym} = St) ->
     mix_premessage_public_keys([{Role, Keys} | Msgs], St#handshake{sym = mix_hash(Sym, Public)}).
 
--spec write_msg(Hs :: handshake(), Msg :: iodata()) -> {binary(), handshake()} | {binary(), cipher(), cipher()}.
+-spec write_msg(Hs :: handshake(), Msg :: iodata()) -> {binary(), handshake()} | {binary(), {cipher(), cipher()}}.
 write_msg(#handshake{hs = [{_, Tokens} | Pats]} = St, Msg) ->
     St1 = #handshake{sym = Sym, buf = Buf} = lists:foldl(fun write_step/2, St#handshake{hs = Pats}, Tokens),
     {NewSym, Crypt} = encrypt_and_hash(Sym, Msg),
     maybe_split(St1#handshake{sym = NewSym, buf = [Buf, Crypt]}).
 
--spec read_msg(Hs :: handshake(), Msg :: iodata()) -> {binary(), handshake()} | {binary(), cipher(), cipher()}.
+-spec read_msg(Hs :: handshake(), Msg :: iodata()) -> {binary(), handshake()} | {binary(), {cipher(), cipher()}}.
 read_msg(#handshake{hs = [{_, Tokens} | Pats]} = St, Msg) ->
     St1 = #handshake{sym = Sym, buf = Buf } = lists:foldl(fun read_step/2, St#handshake{hs = Pats, buf = iolist_to_binary(Msg)}, Tokens),
     {NewSym, Plain} = decrypt_and_hash(Sym, Buf),
@@ -232,9 +300,8 @@ maybe_split(#handshake{role = Role, buf = Buf, hs = [], sym = Sym} = Hs) ->
 maybe_split(#handshake{buf = Buf} = Hs) ->
     {Hs#handshake{buf = []}, Buf}.
 
-swap(ini, {X,Y}) -> {X,Y};
-swap(rsp, {X,Y}) -> {Y,X}.
-
+swap(ini, C) -> C;
+swap(rsp, {H, {In,Out}}) -> {H, {Out,In}}.
 %%%=============================================================================
 %%% Internal Functions - Symmetric state
 %%%=============================================================================
@@ -278,9 +345,10 @@ decrypt_and_hash(#symmetric{cs = Cs, hf = Hf, h = Hash} = Sym, CryptText) ->
     {NewCs, PlainText} = decrypt_with_aad(Cs, Hash, CryptText),
     {Sym#symmetric{h = mix_hash(Hf, Hash, CryptText), cs = NewCs}, PlainText}.
 
-split(#symmetric{hf = Hf, ck = Ck, cs = Cs}) ->
+-spec split(symmetric()) -> {binary(), {cipher(), cipher()}}.
+split(#symmetric{hf = Hf, ck = Ck, cs = Cs, h = H}) ->
     {<<K1:32/binary, _/binary>>, <<K2:32/binary, _/binary>>} = vixen_crypto:hkdf(Hf, Ck, <<>>, 2),
-    split(Cs, K1, K2).
+    {H, split(Cs, K1, K2)}.
 
 -spec has_key(symmetric() | cipher()) -> boolean().
 has_key(#symmetric{cs = Cs}) -> has_key(Cs);
@@ -329,6 +397,7 @@ decrypt_with_aad(#cipher{k = undefined} = Cipher, _AAD, CryptText) ->
 decrypt_with_aad(#cipher{cf = Cf, k = Key, n = N} = Cipher, AAD, CryptText) when N < ?REKEY_NONCE ->
     {Cipher#cipher{n = N + 1}, vixen_crypto:decrypt(Cf, Key, N, AAD, CryptText)}.
 
+-spec split(cipher(), binary(), binary()) -> {cipher(), cipher()}.
 split(#cipher{cf = Cf}, K1, K2) ->
     Cipher = cipher(Cf),
     {initialize_key(Cipher, K1), initialize_key(Cipher, K2)}.
@@ -343,9 +412,9 @@ split(#cipher{cf = Cf}, K1, K2) ->
 
 -include_lib("eunit/include/eunit.hrl").
 
--define(CURVES, [x25519, x448]).
+-define(CURVES,  [x25519, x448]).
 -define(CIPHERS, [chacha20_poly1305, aes_256_gcm]).
--define(HASHES, [sha256, sha512, blake2s, blake2b]).
+-define(HASHES,  [sha256, sha512, blake2s, blake2b]).
 
 %%%-----------------------------------------------------------------------------
 %%% Handshake State Tests 
@@ -357,14 +426,18 @@ handshake_NN_test() ->
     {Ini2, Out1} = write_msg(Ini1, <<>>),
     {Rsp2, <<>>} = read_msg(Rsp1, Out1),
 
-    {_Rsp3, Out2, {RspIn, _RspOut}} = write_msg(Rsp2, <<>>),
-    {_Ini3, <<>>, {_IniIn, IniOut}} = read_msg(Ini2, Out2),
+    {_Rsp3, Out2, {H, {RspOut, RspIn}}} = write_msg(Rsp2, <<>>),
+    {_Ini3, <<>>, {H, {IniOut, IniIn}}} = read_msg(Ini2, Out2),
+
+    ?assertEqual(IniOut, RspIn),
+    ?assertEqual(RspOut, IniIn),
 
     Msg = crypto:strong_rand_bytes(1024),
     Aad = crypto:strong_rand_bytes(32),
 
     {_, MsgX} = encrypt_with_aad(IniOut, Aad, Msg),
-    {_, Msg} = decrypt_with_aad(RspIn, Aad, MsgX).
+    {_, MsgY} = decrypt_with_aad(RspIn, Aad, MsgX),
+    ?assertEqual(MsgY, Msg).
 
 handshake_XX_test() ->
     IniPair = crypto:generate_key(ecdh, x25519),
@@ -379,14 +452,18 @@ handshake_XX_test() ->
     {Rsp3, Out2} = write_msg(Rsp2, <<>>),
     {Ini3, <<>>} = read_msg(Ini2, Out2),
 
-    {_Ini4, Out3, {_IniIn, IniOut}} = write_msg(Ini3, <<>>),
-    {_Rsp4, <<>>, {RspIn, _RspOut}} = read_msg(Rsp3, Out3),
+    {_Ini4, Out3, {_, {IniOut, IniIn}}} = write_msg(Ini3, <<>>),
+    {_Rsp4, <<>>, {_, {RspOut, RspIn}}} = read_msg(Rsp3, Out3),
+
+    ?assertEqual(IniOut, RspIn),
+    ?assertEqual(RspOut, IniIn),
 
     Msg = crypto:strong_rand_bytes(1024),
     Aad = crypto:strong_rand_bytes(32),
 
     {_, MsgX} = encrypt_with_aad(IniOut, Aad, Msg),
-    {_, Msg} = decrypt_with_aad(RspIn, Aad, MsgX).
+    {_, MsgY} = decrypt_with_aad(RspIn, Aad, MsgX),
+    ?assertEqual(MsgY, Msg).
 
 handshake_XXFallback_test() ->
     StaticIniPair = crypto:generate_key(ecdh, x25519),
@@ -394,20 +471,23 @@ handshake_XXFallback_test() ->
     {EphemeralIniPub, _} = EphemeralIniPair = crypto:generate_key(ecdh, x25519),
 
     Mods = [{fallback, true}],
-    Ini1 = handshake(ini, 'XX', x25519, chacha20_poly1305, sha256, [{s, StaticIniPair}, {e, EphemeralIniPair}], [{modifiers, Mods}]),
-    Rsp1 = handshake(rsp, 'XX', x25519, chacha20_poly1305, sha256, [{s, StaticRspPair}, {re, EphemeralIniPub}], [{modifiers, Mods}]),
+    Ini1 = handshake(ini, 'XX', x25519, chacha20_poly1305, sha256, [{s, StaticIniPair}, {e, EphemeralIniPair}], Mods),
+    Rsp1 = handshake(rsp, 'XX', x25519, chacha20_poly1305, sha256, [{s, StaticRspPair}, {re, EphemeralIniPub}], Mods),
 
     {Rsp2, Out1} = write_msg(Rsp1, <<>>),
     {Ini2, <<>>} = read_msg(Ini1, Out1),
 
-    {_Ini3, Out2, {_IniIn, IniOut}} = write_msg(Ini2, <<>>),
-    {_Rsp3, <<>>, {RspIn, _RspOut}} = read_msg(Rsp2, Out2),
+    {_Ini3, Out2, {H, {IniOut, IniIn}}} = write_msg(Ini2, <<>>),
+    {_Rsp3, <<>>, {H, {RspOut, RspIn}}} = read_msg(Rsp2, Out2),
+    ?assertEqual(IniOut, RspIn),
+    ?assertEqual(RspOut, IniIn),
 
     Msg = crypto:strong_rand_bytes(1024),
     Aad = crypto:strong_rand_bytes(32),
 
     {_, MsgX} = encrypt_with_aad(IniOut, Aad, Msg),
-    {_, Msg} = decrypt_with_aad(RspIn, Aad, MsgX).
+    {_, MsgY} = decrypt_with_aad(RspIn, Aad, MsgX),
+    ?assertEqual(MsgY, Msg).
 
 handshake_KK_test() ->
     {IniPub, _IniPriv} = IniPair = crypto:generate_key(ecdh, x25519),
@@ -419,14 +499,17 @@ handshake_KK_test() ->
     {Ini2, Out1} = write_msg(Ini1, <<>>),
     {Rsp2, <<>>} = read_msg(Rsp1, Out1),
 
-    {_Rsp3, Out2, {RspIn, _RspOut}} = write_msg(Rsp2, <<>>),
-    {_Ini3, <<>>, {_IniIn, IniOut}} = read_msg(Ini2, Out2),
+    {_Rsp3, Out2, {H, {RspOut, RspIn}}} = write_msg(Rsp2, <<>>),
+    {_Ini3, <<>>, {H, {IniOut, IniIn}}} = read_msg(Ini2, Out2),
+    ?assertEqual(IniOut, RspIn),
+    ?assertEqual(RspOut, IniIn),
 
     Msg = crypto:strong_rand_bytes(1024),
     Aad = crypto:strong_rand_bytes(32),
 
     {_, MsgX} = encrypt_with_aad(IniOut, Aad, Msg),
-    {_, Msg} = decrypt_with_aad(RspIn, Aad, MsgX).
+    {_, MsgY} = decrypt_with_aad(RspIn, Aad, MsgX),
+    ?assertEqual(MsgY, Msg).
 
 %%%-----------------------------------------------------------------------------
 %%% Symmetric State Tests 
