@@ -44,7 +44,8 @@
 %% A tuple consisting of a public key followed by a private key.
 
 -type key() :: {s, key_pair()} | {e, key_pair()} | {re, public_key()} | {rs, public_key() | {psk, <<_:256>>}}.
-%% Possible key types the client can preconfigure the handshake with.
+%% The key types the client can preconfigure the handshake with. See the
+%% {@section Keys} section of {@link new/7} for more details.
 
 -type token() :: e | s | ee | es | se | ss | psk.
 %% The set of valid message tokens.
@@ -53,7 +54,7 @@
 %% A message pattern describes a sequence of steps taken first by one party, and then
 %% the other.
 %% 
-%% The _initiator_ is the party that executes the steps of the first message pattern.
+%% The initiator is the party that executes the steps of the first message pattern.
 
 -type handshake_pattern() :: [message_pattern()].
 %% A handshake pattern is a list of message-patterns describing a complete handshake.
@@ -61,8 +62,8 @@
 -type prologue_option() :: {prologue, binary()}.
 %% Arbitrary data mixed into the handshake hash. 
 %% 
-%% Both parties must provide identical %% prologue data or the handshake will fail. 
-%% See the %% <a href="https://noiseprotocol.org/noise.html#prologue">Prologue</a>
+%% Both parties must provide identical prologue data or the handshake will fail. 
+%% See the <a href="https://noiseprotocol.org/noise.html#prologue">Prologue</a>
 %% section of the Noise Protocol.
 
 -type db_option() :: {db, module()}.  
@@ -79,11 +80,12 @@
 %% The set of options that may be passed to {@link new/7}.
 
 -export([
-    new/6,
-    new/7,
-    hs_write/1,
-    hs_write/2,
-    hs_read/2
+    new/6, new/7,
+    read/1, read/2, read/3,
+    write/1, write/2, write/3,
+    is_completed/1,
+    rekey/2,
+    set_nonce/3
 ]).
 -export_type([
     cipher_fun/0,
@@ -100,6 +102,12 @@
     role/0,
     token/0
     ]).
+
+-ifdef(TEST).
+-export([set_e/2]).
+-endif.
+
+-include("vixen.hrl").
 
 -record(cipher, {
     vsn :: pos_integer(),  
@@ -133,7 +141,12 @@
     }).
 -type handshake() :: #handshake{}.
 
--include("vixen.hrl").
+-record(channel, {
+    hh   :: binary(),
+    out  :: cipher(),
+    in   :: cipher()
+}).
+
 
 %%%=============================================================================
 %%% Public functions
@@ -149,11 +162,100 @@ new(Role, Hs, Dh, Cf, Hf, Keys) ->
     new(Role, Hs, Dh, Cf, Hf, Keys, []).
 
 %%%-----------------------------------------------------------------------------
-%%% @doc Creates a new handshake with the specified premessage keys and modifiers.
+%%% @doc Creates a new handshake with the specified premessage keys and options.
 %%% 
-%%% This is some text. This is some more.
+%%% A reference is returned representing the created handshake object. The handshake
+%%% is parameterized by the arguments to this function.
 %%% 
-%%% And this is even more.
+%%% <ul>
+%%% <li>`Role' - Whether the handshake plays the role of the initiator (`ini') or 
+%%% responder (`rsp').</li>
+%%% <li>`Hs' - the name of the handhake protocol to be used, e.g. `KK' or `IX'. The actual
+%%% handshake pattern is retrieved from the module indicated by the `db' option, which
+%%% defaults to {@link vixen_db}.</li>
+%%% <li>`Dh' - the curve used for Diffie-Hellman key agreement, either `x25519' or `x448'.</li>
+%%% <li>`Cf' - the symmetric cipher function, either `chacha20_poly1305' or `aes_256_gcm'.</li>
+%%% <li>`Hf' - the hash function, one of `sha256', `sha512', `blake2s' or `blake2b'.</li> 
+%%% <li>`Keys' - Any keys or key-pairs that need to be known to the handshake prior to running
+%%% the protocol, typically your static public/private key-pair, and the other party's
+%%% static public key are declared here. See the {@section Keys} section below for more
+%%% details.</li>
+%%% <li>`Opts' - Any options for the handshake. See the {@section Options} section below for
+%%% more details.</li>
+%%% </ul>
+%%% 
+%%% == Keys ==
+%%% 
+%%% The `Keys' parameter is a proplist (keyword list) that should contain the keys required by
+%%% the chosen handshake protocol. Many protocols require at least a local static key-pair,
+%%% but requirements vary.
+%%% 
+%%% The following atoms identify the corresponding keys:
+%%% 
+%%% <ul>
+%%%   <li>`s' - the local static public/private key-pair.</li>
+%%%   <li>`rs' - the remote static public key.</li>
+%%%   <li>`e' - the local ephemeral public/private key-pair.</li>
+%%%   <li>`re' - the remote ephemeral public key.</li>
+%%%   <li>`psk' - the pre-shared key.</li>
+%%% </ul>
+%%% 
+%%% For example, the 'XX' handshake: 
+%%% 
+%%% <pre lang="text">
+%%% -&gt; e
+%%% &lt;- e, ee, s, es
+%%% -&gt; s, se
+%%% </pre>
+%%% 
+%%% requires both parties to have a static key-pair, whose respective
+%%% public keys are sent to the peer under the protocol. In this case, both parties
+%%% should add the relevant `s' key-pair, when creating the handshake.
+%%%
+%%% In contrast, the 'KK' handshake:
+%%% 
+%%% <pre lang="text">
+%%% -&gt; s
+%%% &lt;- s
+%%% ...
+%%% -&gt; e, es, ss
+%%% &lt;- e, ee, se
+%%% </pre>
+%%% 
+%%% each peer already has the static public key of the other peer <em>prior</em>
+%%% to the protocol starting. In this case, both parties must set their `s'
+%%% key-pair, and also the `rs' key.
+%%% 
+%%% == Options ==
+%%% 
+%%% The following options are supported:
+%%% 
+%%% <ul>
+%%%   <li>`{fallback, boolean()}' - Causes the first message pattern to be treated as a
+%%% premessage pattern and switches the initiator and responder.
+%%% See the <a href="https://noiseprotocol.org/noise.html#the-fallback-modifier">fallback
+%%% modifier</a> section in the Noise Protocol documentation.</li>
+%%%   <li>`{prologue, iodata()}' - Arbitrary data mixed into the handshake hash. See the
+%%% <a href="http://www.noiseprotocol.org/noise.html#prologue">Prologue</a> section in the
+%%% Noise Protocol documentation.</li>
+%%%   <li>`{db, module()}' - The name of the module used to lookup the handshake patterns
+%%% via a name. Such a module should export `lookup/1'. Defaults to {@link vixen_db}.</li>
+%%% </ul>
+%%% 
+%%% <h2>Preflight Checks</h2>
+%%% 
+%%% The function will check that any keys required to be known to the handshake prior to the 
+%%% start of the protocol are available in `Keys'. This includes:
+%%% 
+%%% <ul>
+%%%   <li>Any local static public/private key-pair.</li>
+%%%   <li>Any remote static public key declared in a pre-message pattern.</li>
+%%%   <li>Any pre-shared key (`PSK').</li>
+%%% </ul>
+%%% 
+%%% Additionally, the pre-flight check will confirm that the keys are the correct length for
+%%% the selected DH function.
+%%% 
 %%% @end
 %%%-----------------------------------------------------------------------------
 -spec new(Role :: role(), Hs :: atom(), Dh :: dh_fun(), Cf :: cipher_fun(), Hf :: hash_fun(), Keys :: list(key()), Opts :: list(option())) -> reference().
@@ -162,28 +264,92 @@ new(Role, Hs, Dh, Cf, Hf, Keys, Opts) ->
     put(Ref, handshake(Role, Hs, Dh, Cf, Hf, Keys, Opts)),
     Ref.
 
-hs_write(Ref) ->
-    hs_write(<<>>, Ref).
-hs_write(PlainText, Ref) ->
-    Hs1 = #handshake{} = get(Ref),
-    case write_msg(Hs1, PlainText) of
-        {Hs2, CryptText} ->
-            put(Ref, Hs2),
-            CryptText;
-        {Hs2, CryptText, Result} ->
-            put(Ref, Hs2),
-            {CryptText, Result}
+
+%%%-----------------------------------------------------------------------------
+%%% @doc Return `true' if the handshake is complete, `false' otherwise.
+%%% 
+%%% Once the handshake is complete, the reference can be used for sending and
+%%% receiving application messages.
+%%% 
+%%% @end
+%%%-----------------------------------------------------------------------------
+-spec is_completed(Ref :: reference()) -> boolean().
+is_completed(Ref) ->
+    case get(Ref) of
+        #handshake{} -> false;
+        #channel{} -> true
     end.
 
-hs_read(Ref, CryptText) ->
-    case read_msg(get(Ref), CryptText) of
-        {Hs, PlainText} ->
-            put(Ref, Hs),
-            PlainText;
-        {Hs, PlainText, Result} ->
-            put(Ref, Hs),
-            {PlainText, Result}
+write(Ref) ->
+    write(Ref, <<>>).
+write(Ref, InData) ->
+    case get(Ref) of
+        #handshake{} = Hs ->
+            advance(write, Ref, Hs, InData);
+        #channel{} = Ch ->
+            encrypt(Ref, Ch, InData, <<>>)
     end.
+write(Ref, InData, AAD) ->
+    encrypt(Ref, get(Ref), InData, AAD).
+
+read(Ref) ->
+    read(Ref, <<>>).
+read(Ref, InData) ->
+    case get(Ref) of
+        #handshake{} = Hs ->
+            advance(read, Ref, Hs, InData);
+        #channel{} = Ch ->
+            decrypt(Ref, Ch, InData, <<>>)
+    end.
+read(Ref, InData, AAD) ->
+    decrypt(Ref, get(Ref), InData, AAD).
+
+
+encrypt(Ref, #channel{out = Out} = Ch, InData, AAD) ->
+    {Out2, OutData} = encrypt_with_aad(Out, AAD, InData),
+    put(Ref, Ch#channel{out = Out2}),
+    {ok, OutData}.
+
+decrypt(Ref, #channel{in = In} = Ch, InData, AAD) ->
+    {In2, OutData} = decrypt_with_aad(In, AAD, InData),
+    put(Ref, Ch#channel{in = In2}),
+    {ok, OutData}.
+
+advance(write, Ref, #handshake{role = Role, hs = [{Role, _} | _]} = Hs, InData) ->
+    maybe_complete(Ref, write_msg(Hs, InData));
+advance(read, Ref, #handshake{} = Hs, InData) ->
+    maybe_complete(Ref, read_msg(Hs, InData)).
+
+maybe_complete(Ref, {Hs, Data}) ->
+    put(Ref, Hs),
+    {continue, Data};
+maybe_complete(Ref, {_Hs, Data, {Hash, {Out, In}}}) ->
+    put(Ref, #channel{hh = Hash, in = In, out = Out}),
+    {ok, Data}.
+
+rekey(Ref, in)  -> rekey_by_idx(Ref, #channel.in);
+rekey(Ref, out) -> rekey_by_idx(Ref, #channel.out).
+
+set_nonce(Ref, in,  N) -> set_nonce_by_idx(Ref, #channel.in, N);
+set_nonce(Ref, out, N) -> set_nonce_by_idx(Ref, #channel.out, N).
+
+rekey_by_idx(Ref, Idx) ->
+    #channel{} = Chan = get(Ref),
+    Cipher = element(Idx, Chan),
+    put(Ref, setelement(Idx, Chan, rekey(Cipher))),
+    ok.
+
+set_nonce_by_idx(Ref, Idx, N) ->
+    #channel{} = Chan = get(Ref),
+    Cipher = element(Idx, Chan),
+    put(Ref, setelement(Idx, Chan, set_nonce(Cipher, N))),
+    ok.
+
+-ifdef(TEST).
+set_e(Ref, E) ->
+    #handshake{} = Hs = get(Ref),
+    put(Ref, Hs#handshake{e = E}).
+-endif.
 
 %%%=============================================================================
 %%% Internal Functions - Handshake state
@@ -256,9 +422,11 @@ read_msg(#handshake{hs = [{_, Tokens} | Pats]} = St, Msg) ->
     maybe_split(St1#handshake{sym = NewSym, buf = Plain}).
 
 -spec write_step(token(), handshake()) -> handshake().
-write_step(e, #handshake{e = undefined, dh = Dh, sym = Sym, buf = Buf} = St) ->
-    {EPub, _} = E = vixen_crypto:generate_keypair(Dh),
-    St#handshake{e = E, buf = [Buf, EPub], sym = mix_hash(Sym, EPub)};
+write_step(e, Hs) ->
+    write_e_step(Hs);
+% write_step(e, #handshake{e = undefined, dh = Dh, sym = Sym, buf = Buf} = St) ->
+%     {EPub, _} = E = vixen_crypto:generate_keypair(Dh),
+%     St#handshake{e = E, buf = [Buf, EPub], sym = mix_hash(Sym, EPub)};
 write_step(s, #handshake{buf = Buf, sym = Sym, s = {SPub, _}} = St) ->
     {NewSym, Crypt} = encrypt_and_hash(Sym, SPub),
     St#handshake{buf = [Buf, Crypt], sym = NewSym};
@@ -266,6 +434,18 @@ write_step(psk, #handshake{sym = Sym, psk = Psk, e = {Public, _}} = St) ->
     St#handshake{sym = mix_key(mix_key_and_hash(Sym, Psk), Public)};
 write_step(Tok, St) ->
     common_step(Tok, St).
+
+-ifdef(TEST).
+write_e_step(#handshake{e = undefined, dh = Dh, sym = Sym, buf = Buf} = St) ->
+    {EPub, _} = E = vixen_crypto:generate_keypair(Dh),
+    St#handshake{e = E, buf = [Buf, EPub], sym = mix_hash(Sym, EPub)};
+write_e_step(#handshake{e = {EPub, _}, sym = Sym, buf = Buf} = St) ->
+    St#handshake{buf = [Buf, EPub], sym = mix_hash(Sym, EPub)}.
+-else.
+write_e_step(#handshake{e = undefined, dh = Dh, sym = Sym, buf = Buf} = St) ->
+    {EPub, _} = E = vixen_crypto:generate_keypair(Dh),
+    St#handshake{e = E, buf = [Buf, EPub], sym = mix_hash(Sym, EPub)}.
+-endif.
 
 -spec read_step(token(), handshake()) -> handshake().
 read_step(e, #handshake{dh = Dh, re = undefined, buf = Buf, sym = Sym} = St) ->
@@ -302,6 +482,7 @@ maybe_split(#handshake{buf = Buf} = Hs) ->
 
 swap(ini, C) -> C;
 swap(rsp, {H, {In,Out}}) -> {H, {Out,In}}.
+
 %%%=============================================================================
 %%% Internal Functions - Symmetric state
 %%%=============================================================================
@@ -346,9 +527,9 @@ decrypt_and_hash(#symmetric{cs = Cs, hf = Hf, h = Hash} = Sym, CryptText) ->
     {Sym#symmetric{h = mix_hash(Hf, Hash, CryptText), cs = NewCs}, PlainText}.
 
 -spec split(symmetric()) -> {binary(), {cipher(), cipher()}}.
-split(#symmetric{hf = Hf, ck = Ck, cs = Cs, h = H}) ->
+split(#symmetric{hf = Hf, ck = Ck, cs = Cs} = Sym) ->
     {<<K1:32/binary, _/binary>>, <<K2:32/binary, _/binary>>} = vixen_crypto:hkdf(Hf, Ck, <<>>, 2),
-    {H, split(Cs, K1, K2)}.
+    {get_handshake_hash(Sym), split(Cs, K1, K2)}.
 
 -spec has_key(symmetric() | cipher()) -> boolean().
 has_key(#symmetric{cs = Cs}) -> has_key(Cs);
@@ -376,14 +557,13 @@ cipher(Cf) when Cf =:= chacha20_poly1305 orelse Cf =:= aes_256_gcm ->
 initialize_key(#cipher{} = Cipher, <<Key:32/binary>>) ->
     Cipher#cipher{k = Key, n = 0}.
 
-
 -spec rekey(Cipher :: cipher()) -> cipher().
 rekey(#cipher{cf = Cf, k = Key} = Cipher) ->
     Cipher#cipher{k = vixen_crypto:rekey(Cf, Key)}.
 
 -spec set_nonce(Cipher :: cipher(), Nonce :: non_neg_integer()) -> cipher().
-set_nonce(#cipher{} = Cipher, Nonce) when is_integer(Nonce) andalso Nonce >= 0 ->
-    Cipher#cipher{n = Nonce}.
+set_nonce(#cipher{} = Cipher, N) when is_integer(N), N >= 0, N < ?REKEY_NONCE ->
+    Cipher#cipher{n = N}.
 
 -spec encrypt_with_aad(Cipher :: cipher(), AAD :: iodata(), PlainText :: iodata()) -> {cipher(), iodata()}.
 encrypt_with_aad(#cipher{k = undefined} = Cipher, _AAD, PlainText) ->
@@ -415,6 +595,42 @@ split(#cipher{cf = Cf}, K1, K2) ->
 -define(CURVES,  [x25519, x448]).
 -define(CIPHERS, [chacha20_poly1305, aes_256_gcm]).
 -define(HASHES,  [sha256, sha512, blake2s, blake2b]).
+
+%%%-----------------------------------------------------------------------------
+%%% API Tests 
+%%%-----------------------------------------------------------------------------
+api_NN_test() ->
+    Ini = new(ini, 'NN', x25519, chacha20_poly1305, sha256, []),
+    Rsp = new(rsp, 'NN', x25519, chacha20_poly1305, sha256, []),
+
+    {continue, Out1}  = write(Ini, <<>>),
+    {continue, <<>>}  = read(Rsp, Out1),
+    {ok, Out2} = write(Rsp, <<>>),
+    {ok, <<>>} = read(Ini, Out2),
+
+    AAD = crypto:strong_rand_bytes(32),
+    PlainText = crypto:strong_rand_bytes(1024),
+    {ok, CryptText} = write(Ini, PlainText, AAD),
+    {ok, PlainText} = read(Rsp, CryptText, AAD).
+
+api_KK_test() ->
+    IniPair = crypto:generate_key(ecdh, x25519),
+    RspPair = crypto:generate_key(ecdh, x25519),
+
+    Ini = new(ini, 'XX', x25519, chacha20_poly1305, sha256, [{s, IniPair}], []),
+    Rsp = new(rsp, 'XX', x25519, chacha20_poly1305, sha256, [{s, RspPair}], []),
+
+    {continue, Out1}  = write(Ini, <<>>),
+    {continue, <<>>}  = read(Rsp, Out1),
+    {continue, Out2} = write(Rsp, <<>>),
+    {continue, <<>>} = read(Ini, Out2),
+    {ok, Out3} = write(Ini, <<>>),
+    {ok, <<>>} = read(Rsp, Out3),
+
+    AAD = crypto:strong_rand_bytes(32),
+    PlainText = crypto:strong_rand_bytes(1024),
+    {ok, CryptText} = write(Ini, PlainText, AAD),
+    {ok, PlainText} = read(Rsp, CryptText, AAD).
 
 %%%-----------------------------------------------------------------------------
 %%% Handshake State Tests 
