@@ -31,8 +31,8 @@
 %%% API
 %%%=============================================================================
 
--spec dh(Dh :: vixen:dh_fun(), Private :: vixen:key_pair(), Public :: binary) -> binary().
-dh(Dh, {_, Private}, Public) when Dh =:= x25519 orelse Dh =:= x448 ->
+-spec dh(Dh :: vixen:dh_fun(), vixen:key_pair(), Public :: binary()) -> binary().
+dh(Dh, {_, <<Private/binary>>}, <<Public/binary>>) when Dh =:= x25519 orelse Dh =:= x448 ->
     crypto:compute_key(ecdh, Public, Private, Dh).
 
 -spec dh_len(vixen:dh_fun()) -> 32 | 56.

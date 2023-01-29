@@ -146,6 +146,7 @@
     out  :: cipher(),
     in   :: cipher()
 }).
+-type channel() :: #channel{}.
 
 
 %%%=============================================================================
@@ -323,8 +324,8 @@ advance(read, Ref, #handshake{} = Hs, InData) ->
 maybe_complete(Ref, {Hs, Data}) ->
     put(Ref, Hs),
     {continue, Data};
-maybe_complete(Ref, {_Hs, Data, {Hash, {Out, In}}}) ->
-    put(Ref, #channel{hh = Hash, in = In, out = Out}),
+maybe_complete(Ref, {_Hs, Data, Chan}) ->
+    put(Ref, Chan),
     {ok, Data}.
 
 rekey(Ref, in)  -> rekey_by_idx(Ref, #channel.in);
@@ -391,9 +392,11 @@ modify([_ | Mods], Pats) ->
 
 -spec mix_premessage_public_keys(St :: handshake()) -> handshake().
 mix_premessage_public_keys(#handshake{hs = Hs} = St) ->
-    case string:str(Hs, [?SEP]) of
-        0 -> St;
-        N -> mix_premessage_public_keys(lists:sublist(Hs, N - 1), St#handshake{hs = lists:nthtail(N, Hs)})
+    case split_at_sep(Hs) of
+        undefined ->
+            St;
+        {Pre, Post} ->
+            mix_premessage_public_keys(Pre, St#handshake{hs = Post})
     end.
 
 -spec mix_premessage_public_keys([message_pattern()], St :: handshake()) -> handshake().
@@ -409,13 +412,13 @@ mix_premessage_public_keys([{Role, [e | Keys]} | Msgs], #handshake{role = Role, 
 mix_premessage_public_keys([{Role, [e | Keys]} | Msgs], #handshake{re = Public, sym = Sym} = St) ->
     mix_premessage_public_keys([{Role, Keys} | Msgs], St#handshake{sym = mix_hash(Sym, Public)}).
 
--spec write_msg(Hs :: handshake(), Msg :: iodata()) -> {binary(), handshake()} | {binary(), {cipher(), cipher()}}.
+-spec write_msg(Hs :: handshake(), Msg :: iodata()) -> {handshake(), iodata()} | {handshake(), iodata(), channel()}.
 write_msg(#handshake{hs = [{_, Tokens} | Pats]} = St, Msg) ->
     St1 = #handshake{sym = Sym, buf = Buf} = lists:foldl(fun write_step/2, St#handshake{hs = Pats}, Tokens),
     {NewSym, Crypt} = encrypt_and_hash(Sym, Msg),
     maybe_split(St1#handshake{sym = NewSym, buf = [Buf, Crypt]}).
 
--spec read_msg(Hs :: handshake(), Msg :: iodata()) -> {binary(), handshake()} | {binary(), {cipher(), cipher()}}.
+-spec read_msg(Hs :: handshake(), Msg :: iodata()) -> {handshake(), iodata()} | {handshake(), iodata(), channel()}.
 read_msg(#handshake{hs = [{_, Tokens} | Pats]} = St, Msg) ->
     St1 = #handshake{sym = Sym, buf = Buf } = lists:foldl(fun read_step/2, St#handshake{hs = Pats, buf = iolist_to_binary(Msg)}, Tokens),
     {NewSym, Plain} = decrypt_and_hash(Sym, Buf),
@@ -424,9 +427,6 @@ read_msg(#handshake{hs = [{_, Tokens} | Pats]} = St, Msg) ->
 -spec write_step(token(), handshake()) -> handshake().
 write_step(e, Hs) ->
     write_e_step(Hs);
-% write_step(e, #handshake{e = undefined, dh = Dh, sym = Sym, buf = Buf} = St) ->
-%     {EPub, _} = E = vixen_crypto:generate_keypair(Dh),
-%     St#handshake{e = E, buf = [Buf, EPub], sym = mix_hash(Sym, EPub)};
 write_step(s, #handshake{buf = Buf, sym = Sym, s = {SPub, _}} = St) ->
     {NewSym, Crypt} = encrypt_and_hash(Sym, SPub),
     St#handshake{buf = [Buf, Crypt], sym = NewSym};
@@ -475,13 +475,15 @@ common_step(se, #handshake{role = rsp, sym = Sym, dh = Dh, e = E, rs = Rs} = St)
 common_step(ss, #handshake{sym = Sym, dh = Dh, s = S, rs = Rs} = St) ->
     St#handshake{sym = mix_key(Sym, vixen_crypto:dh(Dh, S, Rs))}.
 
+-spec maybe_split(handshake()) -> {handshake(), iodata()} | {handshake(), iodata(), channel()}.
 maybe_split(#handshake{role = Role, buf = Buf, hs = [], sym = Sym} = Hs) ->
     {Hs#handshake{buf = []}, Buf, swap(Role, split(Sym))};
 maybe_split(#handshake{buf = Buf} = Hs) ->
     {Hs#handshake{buf = []}, Buf}.
 
+-spec swap(role(), channel()) -> channel().
 swap(ini, C) -> C;
-swap(rsp, {H, {In,Out}}) -> {H, {Out,In}}.
+swap(rsp, #channel{in = In, out = Out} = C) -> C#channel{in = Out, out = In}.
 
 %%%=============================================================================
 %%% Internal Functions - Symmetric state
@@ -526,10 +528,11 @@ decrypt_and_hash(#symmetric{cs = Cs, hf = Hf, h = Hash} = Sym, CryptText) ->
     {NewCs, PlainText} = decrypt_with_aad(Cs, Hash, CryptText),
     {Sym#symmetric{h = mix_hash(Hf, Hash, CryptText), cs = NewCs}, PlainText}.
 
--spec split(symmetric()) -> {binary(), {cipher(), cipher()}}.
+-spec split(symmetric()) -> channel().
 split(#symmetric{hf = Hf, ck = Ck, cs = Cs} = Sym) ->
     {<<K1:32/binary, _/binary>>, <<K2:32/binary, _/binary>>} = vixen_crypto:hkdf(Hf, Ck, <<>>, 2),
-    {get_handshake_hash(Sym), split(Cs, K1, K2)}.
+    {C1, C2} = split(Cs, K1, K2),
+    #channel{hh = get_handshake_hash(Sym), out = C1, in = C2}.
 
 -spec has_key(symmetric() | cipher()) -> boolean().
 has_key(#symmetric{cs = Cs}) -> has_key(Cs);
@@ -581,6 +584,15 @@ decrypt_with_aad(#cipher{cf = Cf, k = Key, n = N} = Cipher, AAD, CryptText) when
 split(#cipher{cf = Cf}, K1, K2) ->
     Cipher = cipher(Cf),
     {initialize_key(Cipher, K1), initialize_key(Cipher, K2)}.
+
+split_at_sep(Pre) ->
+    split_at_sep(Pre, []).
+split_at_sep([], _) -> 
+    undefined;
+split_at_sep([?SEP | Post], Pre) ->
+    {lists:reverse(Pre), Post};
+split_at_sep([E | Post], Pre) ->
+    split_at_sep(Post, [E | Pre]).
 
 
 
@@ -642,8 +654,8 @@ handshake_NN_test() ->
     {Ini2, Out1} = write_msg(Ini1, <<>>),
     {Rsp2, <<>>} = read_msg(Rsp1, Out1),
 
-    {_Rsp3, Out2, {H, {RspOut, RspIn}}} = write_msg(Rsp2, <<>>),
-    {_Ini3, <<>>, {H, {IniOut, IniIn}}} = read_msg(Ini2, Out2),
+    {_Rsp3, Out2, #channel{hh = H, out = RspOut, in = RspIn}} = write_msg(Rsp2, <<>>),
+    {_Ini3, <<>>, #channel{hh = H, out = IniOut, in = IniIn}} = read_msg(Ini2, Out2),
 
     ?assertEqual(IniOut, RspIn),
     ?assertEqual(RspOut, IniIn),
@@ -668,8 +680,8 @@ handshake_XX_test() ->
     {Rsp3, Out2} = write_msg(Rsp2, <<>>),
     {Ini3, <<>>} = read_msg(Ini2, Out2),
 
-    {_Ini4, Out3, {_, {IniOut, IniIn}}} = write_msg(Ini3, <<>>),
-    {_Rsp4, <<>>, {_, {RspOut, RspIn}}} = read_msg(Rsp3, Out3),
+    {_Ini4, Out3, #channel{hh = H, out = IniOut, in = IniIn}} = write_msg(Ini3, <<>>),
+    {_Rsp4, <<>>, #channel{hh = H, out = RspOut, in = RspIn}} = read_msg(Rsp3, Out3),
 
     ?assertEqual(IniOut, RspIn),
     ?assertEqual(RspOut, IniIn),
@@ -693,8 +705,8 @@ handshake_XXFallback_test() ->
     {Rsp2, Out1} = write_msg(Rsp1, <<>>),
     {Ini2, <<>>} = read_msg(Ini1, Out1),
 
-    {_Ini3, Out2, {H, {IniOut, IniIn}}} = write_msg(Ini2, <<>>),
-    {_Rsp3, <<>>, {H, {RspOut, RspIn}}} = read_msg(Rsp2, Out2),
+    {_Ini3, Out2, #channel{hh = H, out = IniOut, in = IniIn}} = write_msg(Ini2, <<>>),
+    {_Rsp3, <<>>, #channel{hh = H, out = RspOut, in = RspIn}} = read_msg(Rsp2, Out2),
     ?assertEqual(IniOut, RspIn),
     ?assertEqual(RspOut, IniIn),
 
@@ -715,8 +727,8 @@ handshake_KK_test() ->
     {Ini2, Out1} = write_msg(Ini1, <<>>),
     {Rsp2, <<>>} = read_msg(Rsp1, Out1),
 
-    {_Rsp3, Out2, {H, {RspOut, RspIn}}} = write_msg(Rsp2, <<>>),
-    {_Ini3, <<>>, {H, {IniOut, IniIn}}} = read_msg(Ini2, Out2),
+    {_Rsp3, Out2, #channel{hh = H, out = RspOut, in = RspIn}} = write_msg(Rsp2, <<>>),
+    {_Ini3, <<>>, #channel{hh = H, out = IniOut, in = IniIn}} = read_msg(Ini2, Out2),
     ?assertEqual(IniOut, RspIn),
     ?assertEqual(RspOut, IniIn),
 
@@ -851,4 +863,14 @@ cipher_encrypt_decrypt(C1_1, C2_1) ->
     {_, DecryptText2} = decrypt_with_aad(C2_2, AAD, CryptText2),
     ?assertEqual(PlainText, DecryptText2).
 
+%%%-----------------------------------------------------------------------------
+%%% Utility Tests 
+%%%-----------------------------------------------------------------------------
+split_at_sep_test() ->
+    ?assertEqual(undefined, split_at_sep([])),
+    ?assertEqual(undefined, split_at_sep([1,2,3])),
+    ?assertEqual({[1],[2,3]}, split_at_sep([1,?SEP,2,3])),
+    ?assertEqual({[],[1,2,3]}, split_at_sep([?SEP,1,2,3])),
+    ?assertEqual({[1,2,3],[]}, split_at_sep([1,2,3,?SEP])),
+    ok.
 -endif. % TEST
