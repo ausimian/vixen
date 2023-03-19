@@ -103,10 +103,6 @@
     token/0
     ]).
 
--ifdef(TEST).
--export([set_e/2]).
--endif.
-
 -include("vixen.hrl").
 
 -record(cipher, {
@@ -136,7 +132,8 @@
     e    :: undefined | key_pair(),
     rs   :: undefined | binary(),
     re   :: undefined | binary(),
-    psk  :: undefined | binary(),
+    psks :: [binary()],
+    fpsk :: boolean(),
     buf  :: iodata()    
     }).
 -type handshake() :: #handshake{}.
@@ -148,6 +145,10 @@
 }).
 -type channel() :: #channel{}.
 
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+-endif.
 
 %%%=============================================================================
 %%% Public functions
@@ -198,7 +199,7 @@ new(Role, Hs, Dh, Cf, Hf, Keys) ->
 %%%   <li>`rs' - the remote static public key.</li>
 %%%   <li>`e' - the local ephemeral public/private key-pair.</li>
 %%%   <li>`re' - the remote ephemeral public key.</li>
-%%%   <li>`psk' - the pre-shared key.</li>
+%%%   <li>`psks' - the pre-shared keys.</li>
 %%% </ul>
 %%% 
 %%% For example, the 'XX' handshake: 
@@ -251,7 +252,7 @@ new(Role, Hs, Dh, Cf, Hf, Keys) ->
 %%% <ul>
 %%%   <li>Any local static public/private key-pair.</li>
 %%%   <li>Any remote static public key declared in a pre-message pattern.</li>
-%%%   <li>Any pre-shared key (`PSK').</li>
+%%%   <li>Any pre-shared keys (`PSK').</li>
 %%% </ul>
 %%% 
 %%% Additionally, the pre-flight check will confirm that the keys are the correct length for
@@ -346,20 +347,15 @@ set_nonce_by_idx(Ref, Idx, N) ->
     put(Ref, setelement(Idx, Chan, set_nonce(Cipher, N))),
     ok.
 
--ifdef(TEST).
-set_e(Ref, E) ->
-    #handshake{} = Hs = get(Ref),
-    put(Ref, Hs#handshake{e = E}).
--endif.
-
 %%%=============================================================================
 %%% Internal Functions - Handshake state
 %%%=============================================================================
 
 -spec handshake(Role :: role(), Hs :: atom(), Dh :: dh_fun(), Cf :: cipher_fun(), Hf :: hash_fun(), Keys :: list(key()), Opts :: list(option())) -> handshake().
 handshake(Role, Hs, Dh, Cf, Hf, Keys, Opts) when Role =:= ini orelse Role =:= rsp ->
-    Db = proplists:get_value(db, Opts, vixen_db),
-    St = #handshake{
+    Db   = proplists:get_value(db, Opts, vixen_db),
+    Psks = proplists:get_value(psk, Keys, []),
+    St   = #handshake{
         vsn  = ?VSN, 
         sym  = mix_hash(symmetric(Hs, Dh, Cf, Hf), proplists:get_value(prologue, Opts, <<>>)),
         role = Role,
@@ -369,7 +365,8 @@ handshake(Role, Hs, Dh, Cf, Hf, Keys, Opts) when Role =:= ini orelse Role =:= rs
         e    = proplists:get_value(e, Keys),
         rs   = proplists:get_value(rs, Keys),
         re   = proplists:get_value(re, Keys),
-        psk  = proplists:get_value(psk, Keys),
+        psks = Psks,
+        fpsk = length(Psks) > 0,
         buf  = []},
     mix_premessage_public_keys(St).
 
@@ -408,9 +405,13 @@ mix_premessage_public_keys([{Role, [s | Keys]} | Msgs], #handshake{role = Role, 
 mix_premessage_public_keys([{Role, [s | Keys]} | Msgs], #handshake{rs = Public, sym = Sym} = St) ->
     mix_premessage_public_keys([{Role, Keys} | Msgs], St#handshake{sym = mix_hash(Sym, Public)});
 mix_premessage_public_keys([{Role, [e | Keys]} | Msgs], #handshake{role = Role, e = {Public, _}, sym = Sym} = St) ->
-    mix_premessage_public_keys([{Role, Keys} | Msgs], St#handshake{sym = mix_hash(Sym, Public)});
+    mix_premessage_public_keys([{Role, Keys} | Msgs], maybe_mix_key(St#handshake{sym = mix_hash(Sym, Public)}));
 mix_premessage_public_keys([{Role, [e | Keys]} | Msgs], #handshake{re = Public, sym = Sym} = St) ->
     mix_premessage_public_keys([{Role, Keys} | Msgs], St#handshake{sym = mix_hash(Sym, Public)}).
+
+maybe_mix_key(#handshake{fpsk = false} = Hs) -> Hs;
+maybe_mix_key(#handshake{sym = Sym, e = {Public, _}} = Hs) ->
+    Hs#handshake{sym = mix_key(Sym, Public)}.
 
 -spec write_msg(Hs :: handshake(), Msg :: iodata()) -> {handshake(), iodata()} | {handshake(), iodata(), channel()}.
 write_msg(#handshake{hs = [{_, Tokens} | Pats]} = St, Msg) ->
@@ -425,39 +426,35 @@ read_msg(#handshake{hs = [{_, Tokens} | Pats]} = St, Msg) ->
     maybe_split(St1#handshake{sym = NewSym, buf = Plain}).
 
 -spec write_step(token(), handshake()) -> handshake().
-write_step(e, Hs) ->
-    write_e_step(Hs);
+write_step(e, #handshake{e = undefined, dh = Dh} = St) ->
+    write_step(e, St#handshake{e = vixen_crypto:generate_keypair(Dh)});
+write_step(e, #handshake{e = {EPub, _}, sym = Sym, buf = Buf} = St) ->
+    case St#handshake{buf = [Buf, EPub], sym = mix_hash(Sym, EPub)} of
+        #handshake{fpsk = false} = St1 ->
+            St1;
+        #handshake{sym = NewSym} = St1 ->
+            St1#handshake{sym = mix_key(NewSym, EPub)}
+    end;
 write_step(s, #handshake{buf = Buf, sym = Sym, s = {SPub, _}} = St) ->
     {NewSym, Crypt} = encrypt_and_hash(Sym, SPub),
     St#handshake{buf = [Buf, Crypt], sym = NewSym};
-write_step(psk, #handshake{sym = Sym, psk = Psk, e = {Public, _}} = St) ->
-    St#handshake{sym = mix_key(mix_key_and_hash(Sym, Psk), Public)};
 write_step(Tok, St) ->
     common_step(Tok, St).
-
--ifdef(TEST).
-write_e_step(#handshake{e = undefined, dh = Dh, sym = Sym, buf = Buf} = St) ->
-    {EPub, _} = E = vixen_crypto:generate_keypair(Dh),
-    St#handshake{e = E, buf = [Buf, EPub], sym = mix_hash(Sym, EPub)};
-write_e_step(#handshake{e = {EPub, _}, sym = Sym, buf = Buf} = St) ->
-    St#handshake{buf = [Buf, EPub], sym = mix_hash(Sym, EPub)}.
--else.
-write_e_step(#handshake{e = undefined, dh = Dh, sym = Sym, buf = Buf} = St) ->
-    {EPub, _} = E = vixen_crypto:generate_keypair(Dh),
-    St#handshake{e = E, buf = [Buf, EPub], sym = mix_hash(Sym, EPub)}.
--endif.
 
 -spec read_step(token(), handshake()) -> handshake().
 read_step(e, #handshake{dh = Dh, re = undefined, buf = Buf, sym = Sym} = St) ->
     {Re, Rest} = split_binary(Buf, vixen_crypto:dh_len(Dh)),
-    St#handshake{buf = Rest, re = Re, sym = mix_hash(Sym, Re)};
+    case St#handshake{buf = Rest, re = Re, sym = mix_hash(Sym, Re)} of
+        #handshake{fpsk = false} = St1 ->
+            St1;
+        #handshake{re = Re, sym = NewSym} = St1 ->
+            St1#handshake{sym = mix_key(NewSym, Re)}
+    end;
 read_step(s, #handshake{dh = Dh, rs = undefined, buf = Buf, sym = Sym} = St) ->
     KeyLen = vixen_crypto:dh_len(Dh) + (case has_key(Sym) of true -> 16; false -> 0 end),
     {Temp, Rest} = split_binary(Buf, KeyLen),
     {NewSym, Plain} = decrypt_and_hash(Sym, Temp),
     St#handshake{buf = Rest, rs = Plain, sym = NewSym};
-read_step(psk, #handshake{sym = Sym, psk = Psk, re = Public} = St) ->
-    St#handshake{sym = mix_key(mix_key_and_hash(Sym, Psk), Public)};
 read_step(Tok, St) ->
     common_step(Tok, St).
 
@@ -473,7 +470,9 @@ common_step(se, #handshake{role = ini, sym = Sym, dh = Dh, s = S, re = Re} = St)
 common_step(se, #handshake{role = rsp, sym = Sym, dh = Dh, e = E, rs = Rs} = St) ->
     St#handshake{sym = mix_key(Sym, vixen_crypto:dh(Dh, E, Rs))};
 common_step(ss, #handshake{sym = Sym, dh = Dh, s = S, rs = Rs} = St) ->
-    St#handshake{sym = mix_key(Sym, vixen_crypto:dh(Dh, S, Rs))}.
+    St#handshake{sym = mix_key(Sym, vixen_crypto:dh(Dh, S, Rs))};
+common_step(psk, #handshake{sym = Sym, psks = [Psk|Psks]} = St) ->
+    St#handshake{sym = mix_key_and_hash(Sym, Psk), psks = Psks}.
 
 -spec maybe_split(handshake()) -> {handshake(), iodata()} | {handshake(), iodata(), channel()}.
 maybe_split(#handshake{role = Role, buf = Buf, hs = [], sym = Sym} = Hs) ->
@@ -601,8 +600,6 @@ split_at_sep([E | Post], Pre) ->
 %%%=============================================================================
 
 -ifdef(TEST).
-
--include_lib("eunit/include/eunit.hrl").
 
 -define(CURVES,  [x25519, x448]).
 -define(CIPHERS, [chacha20_poly1305, aes_256_gcm]).
