@@ -351,8 +351,13 @@ set_nonce_by_idx(Ref, Idx, N) ->
 %%% Internal Functions - Handshake state
 %%%=============================================================================
 
--spec handshake(Role :: role(), Hs :: atom(), Dh :: dh_fun(), Cf :: cipher_fun(), Hf :: hash_fun(), Keys :: list(key()), Opts :: list(option())) -> handshake().
-handshake(Role, Hs, Dh, Cf, Hf, Keys, Opts) when Role =:= ini orelse Role =:= rsp ->
+handshake(Role, Name, Keys) when Role =:= ini orelse Role =:= rsp, is_binary(Name), is_list(Keys) ->
+    handshake(Role, Name, Keys, []).
+handshake(Role, <<"Noise_", Parts/binary>> = Name, Keys, Opts) when Role =:= ini orelse Role =:= rsp, is_list(Keys), is_list(Opts) ->
+    [HsWithMods, Curve, Cipher, Hash] = binary:split(Parts, [global, trim_all]),
+    {match,[{0,N}]} = re:run(HsWithMods, "^[A-Z0-9]+"),
+    {Hs, Mods}     = split_binary(HsWithMods, N),
+
     Db   = proplists:get_value(db, Opts, vixen_db),
     Psks = proplists:get_value(psk, Keys, []),
     St   = #handshake{
@@ -360,7 +365,7 @@ handshake(Role, Hs, Dh, Cf, Hf, Keys, Opts) when Role =:= ini orelse Role =:= rs
         sym  = mix_hash(symmetric(Hs, Dh, Cf, Hf), proplists:get_value(prologue, Opts, <<>>)),
         role = Role,
         dh   = Dh,
-        hs   = modify(Opts, Db:lookup(Hs)),
+        hs   = modify_pattern(binary:split(Mods, <<"+">>, [global, trim_all]), Db:lookup(Hs)),
         s    = proplists:get_value(s, Keys),
         e    = proplists:get_value(e, Keys),
         rs   = proplists:get_value(rs, Keys),
@@ -370,22 +375,59 @@ handshake(Role, Hs, Dh, Cf, Hf, Keys, Opts) when Role =:= ini orelse Role =:= rs
         buf  = []},
     mix_premessage_public_keys(St).
 
-modify([], Pats) ->
+
+
+% -spec handshake(Role :: role(), Hs :: atom(), Dh :: dh_fun(), Cf :: cipher_fun(), Hf :: hash_fun(), Keys :: list(key()), Opts :: list(option())) -> handshake().
+% handshake(Role, Hs, Dh, Cf, Hf, Keys, Opts) when Role =:= ini orelse Role =:= rsp ->
+%     Db   = proplists:get_value(db, Opts, vixen_db),
+%     Psks = proplists:get_value(psk, Keys, []),
+%     St   = #handshake{
+%         vsn  = ?VSN, 
+%         sym  = mix_hash(symmetric(Hs, Dh, Cf, Hf), proplists:get_value(prologue, Opts, <<>>)),
+%         role = Role,
+%         dh   = Dh,
+%         hs   = modify_patt(Opts, Db:lookup(Hs)),
+%         s    = proplists:get_value(s, Keys),
+%         e    = proplists:get_value(e, Keys),
+%         rs   = proplists:get_value(rs, Keys),
+%         re   = proplists:get_value(re, Keys),
+%         psks = Psks,
+%         fpsk = length(Psks) > 0,
+%         buf  = []},
+%     mix_premessage_public_keys(St).
+
+modify_pattern([], Pats) ->
     Pats;
-modify([{fallback, true} | Mods], Pats) ->
-    modify([fallback | Mods], Pats);
-modify([{fallback, false} | Mods], Pats) ->
-    modify(Mods, Pats);
-modify([fallback | Mods], [Pat | Pats]) ->
+modify_pattern([<<"fallback">> | Mods], [Pat | Pats]) ->
     NewPats = 
         case Pat of
             {ini, [e]} -> [Pat, {} | Pats];
             {ini, [s]} -> [Pat, {} | Pats];
             {ini, [e, s]} -> [Pat, {} | Pats]
         end,
-    modify(Mods, NewPats);
-modify([_ | Mods], Pats) ->
-    modify(Mods, Pats).
+    modify_pattern(Mods, NewPats);
+modify_pattern([<<"psk", N>> | Mods], Pats) when N >= $0 andalso N =< $9 ->
+    {Pre, Post} =
+        case split_at_sep(Pats) of
+            undefined -> {[], Pats};
+            Other -> Other
+        end,
+    NewPost = 
+        case N - $0 of
+            0 -> 
+                {Role, Patt} = hd(Post),
+                [{Role, [psk | Patt]} | tl(Post)];
+            N ->
+                {Before, [{Role, Patt} | After]} = lists:split(N - 1, Post),
+                Before ++ [{Role, Patt ++ [psk]} | After]
+        end,
+    NewPats =
+        case Pre of
+            [] -> NewPost;
+            _  -> Pre ++ [{} | NewPost ]
+        end,
+    modify_pattern(Mods, NewPats).
+
 
 -spec mix_premessage_public_keys(St :: handshake()) -> handshake().
 mix_premessage_public_keys(#handshake{hs = Hs} = St) ->
